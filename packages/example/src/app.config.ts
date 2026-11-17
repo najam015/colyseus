@@ -20,6 +20,10 @@ import { PostgresDriver } from "@colyseus/drizzle-driver";
 // const client = new Client<typeof server>("ws://localhost:2567");
 
 import { MyRoom } from "./MyRoom.ts";
+// Fort Conquerors' live arena: matchmaking by fort power, and one relay room
+// per match (created by the queue — never joined by matchmaking).
+import { ArenaQueueRoom } from "./ArenaQueueRoom.ts";
+import { ArenaMatchRoom } from "./ArenaMatchRoom.ts";
 
 auth.oauth.addProvider("discord", {
   key: "799645393566695465",
@@ -240,6 +244,8 @@ export const server = config({
     my_room: defineRoom(MyRoom).
       filterBy(["progress"]).
       sortBy({ clients: -1 }),
+    fc_arena_queue: defineRoom(ArenaQueueRoom),
+    fc_arena: defineRoom(ArenaMatchRoom),
   },
 
   routes: createRouter({
