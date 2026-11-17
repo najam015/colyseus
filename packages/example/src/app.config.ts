@@ -8,6 +8,7 @@ import config, { listen } from "@colyseus/tools";
 import { createEndpoint, createRouter, defineRoom, matchMaker } from "@colyseus/core";
 import { playground } from "@colyseus/playground";
 import { monitor } from "@colyseus/monitor";
+import { monitorGuard } from "./monitorGuard.ts";
 import { auth } from "@colyseus/auth";
 import { z } from "zod";
 import { exposeServerToTraefik } from "@colyseus/traefik";
@@ -308,7 +309,8 @@ export const server = config({
   initializeExpress: (app) => {
     // app.use("/playground", playground());
     app.use("/", playground());
-    app.use("/monitor", monitor());
+    // password-protected: MONITOR_USERNAME / MONITOR_PASSWORD (src/monitorGuard.ts)
+    app.use("/monitor", monitorGuard(), monitor());
     app.get("/express", (_, res) => res.json({ message: "Hello World" }));
     app.use(auth.prefix, auth.routes({}));
   },
