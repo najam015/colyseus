@@ -307,10 +307,11 @@ export const server = config({
   }),
 
   initializeExpress: (app) => {
-    // app.use("/playground", playground());
-    app.use("/", playground());
-    // password-protected: MONITOR_USERNAME / MONITOR_PASSWORD (src/monitorGuard.ts)
-    app.use("/monitor", monitorGuard(), monitor());
+    // both password-protected, one login: MONITOR_USERNAME / MONITOR_PASSWORD
+    // (src/monitorGuard.ts). The playground is NOT mounted at "/": a guard
+    // there would sit in front of every request the game itself makes.
+    app.use("/playground", monitorGuard("Colyseus playground"), playground());
+    app.use("/monitor", monitorGuard("Colyseus monitor"), monitor());
     app.get("/express", (_, res) => res.json({ message: "Hello World" }));
     app.use(auth.prefix, auth.routes({}));
   },
