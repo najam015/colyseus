@@ -69,6 +69,11 @@ function cleanEntry(o: any): ArenaEntry {
 export class ArenaQueueRoom extends Room {
   /** One queue for everybody: never full, never hidden. */
   maxClients = 1000;
+  /** Seconds a reserved seat waits for its WebSocket (Colyseus default 15).
+   *  Through Cloudflare from Pakistan the WebSocket handshake alone measured
+   *  15.3 s, so the seat expired before the phone arrived ("seat reservation
+   *  expired") and every search ended with the bot. */
+  seatReservationTimeout = 60;
   private waiting = new Map<string, Waiting>();   // sessionId -> waiting phone
   private matched = new Map<string, any>();       // sessionId -> its seat, until it leaves
 

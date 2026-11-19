@@ -24,26 +24,36 @@
  * still connecting, or it has joined but not said "ready") wait here and go
  * to it on "ready" — sent on join, they would arrive before the phone had
  * attached its handlers, and be dropped. A dropped phone gets a
- * few seconds to come back (the SDK reconnects by itself); after that the
- * other side hears "left" and its bot plays on.
+ * 45 s to come back (the SDK reconnects by itself), its events held here
+ * meanwhile; after that the other side hears "left" and wins.
  */
 import { Room, type Client, CloseCode } from "@colyseus/core";
 
-const RECONNECT_SECONDS = 8;
+/** A dropped phone's window to come back. It was 8 s; on a slow, unstable
+ *  link (Pakistan, 2026-11) one reconnect handshake alone can take 15 s. */
+const RECONNECT_SECONDS = 45;
 const MAX_EVENT_CHARS = 2000;
-const MAX_BUFFERED = 500;
+const MAX_BUFFERED = 2000;   // ~45 s of a busy match (fort reports, acks, releases)
 
 type Side = "a" | "b";
 const otherOf = (s: Side): Side => (s === "a" ? "b" : "a");
 
 export class ArenaMatchRoom extends Room {
   maxClients = 2;
+  /** Seconds a reserved seat waits for its WebSocket (Colyseus default 15).
+   *  Through Cloudflare from Pakistan the WebSocket handshake alone measured
+   *  15.3 s, so the seat expired before the phone arrived ("seat reservation
+   *  expired") and every search ended with the bot. */
+  seatReservationTimeout = 60;
   private node: any;
   private clients_ = new Map<Side, Client>();
   private sideOf = new Map<string, Side>();       // sessionId -> side
   private buffered: Record<Side, any[]> = { a: [], b: [] };
   private gone = new Set<Side>();
   private ready = new Set<Side>();
+  /** Sides whose socket dropped and may come back: their events wait in
+   *  `buffered` (sent to a dropped socket they would be lost). */
+  private dropped = new Set<Side>();
 
   messages = {
     ready: (client: Client) => {
@@ -87,12 +97,19 @@ export class ArenaMatchRoom extends Room {
   }
 
   onDrop(client: Client) {
+    const side = this.sideOf.get(client.sessionId);
+    if (side) this.dropped.add(side);
     this.allowReconnection(client, RECONNECT_SECONDS).catch(() => {});
   }
 
   onReconnect(client: Client) {
     const side = this.sideOf.get(client.sessionId);
-    if (side) this.clients_.set(side, client);
+    if (!side) return;
+    this.clients_.set(side, client);
+    this.dropped.delete(side);
+    // what was said while it was away (the phone also asks the other for
+    // anything lost in flight, and drops what it already had)
+    if (this.ready.has(side)) for (const [type, msg] of this.buffered[side].splice(0)) client.send(type, msg);
   }
 
   onLeave(client: Client, code: CloseCode) {
@@ -108,7 +125,7 @@ export class ArenaMatchRoom extends Room {
 
   private toSide(side: Side, type: string, msg: unknown) {
     const c = this.clients_.get(side);
-    if (c && this.ready.has(side)) { c.send(type, msg); return; }
+    if (c && this.ready.has(side) && !this.dropped.has(side)) { c.send(type, msg); return; }
     if (this.gone.has(side)) return;
     const q = this.buffered[side];
     if (q.length < MAX_BUFFERED) q.push([type, msg]);
