@@ -51,6 +51,9 @@ export function pickByFortPower<T extends { fortPower: number; ts?: number }>(po
   return null;
 }
 
+/** "Hamza (FP 3000)" — how a player reads on the monitor. */
+const label = (e: ArenaEntry) => `${e.name || "(no name)"} (FP ${e.fortPower})`;
+
 const int = (v: unknown, lo: number, hi: number, dflt: number) =>
   Number.isFinite(Number(v)) ? Math.max(lo, Math.min(hi, Math.round(Number(v)))) : dflt;
 
@@ -76,6 +79,9 @@ export class ArenaQueueRoom extends Room {
   seatReservationTimeout = 60;
   private waiting = new Map<string, Waiting>();   // sessionId -> waiting phone
   private matched = new Map<string, any>();       // sessionId -> its seat, until it leaves
+  /** The last pairings, newest first — for the /monitor panel only. */
+  private recent: Array<{ at: string; a: string; b: string; matchId: string }> = [];
+  private matchesStarted = 0;
 
   messages = {
     /** The phone's deadline: out of the queue, unless it was just paired.
@@ -88,6 +94,7 @@ export class ArenaQueueRoom extends Room {
       if (w?.paired) return;                     // the seat is on its way as "matched"
       this.waiting.delete(client.sessionId);
       client.send("cancelled", true);
+      this.publish();
     },
   };
 
@@ -100,12 +107,14 @@ export class ArenaQueueRoom extends Room {
     const entry = cleanEntry(options?.entry);
     if (entry.proto !== ARENA_PROTO) { client.leave(CloseCode.WITH_ERROR, "protocol"); return; }
     this.waiting.set(client.sessionId, { client, entry, ts: Date.now(), paired: false });
+    this.publish();
   }
 
   onLeave(client: Client) {
     const w = this.waiting.get(client.sessionId);
     if (w && !w.paired) this.waiting.delete(client.sessionId);
     this.matched.delete(client.sessionId);
+    this.publish();
   }
 
   private async pairUp() {
@@ -154,5 +163,45 @@ export class ArenaQueueRoom extends Room {
     // they leave by themselves once they have their seat; forget them now
     this.waiting.delete(a.client.sessionId);
     this.waiting.delete(b.client.sessionId);
+    this.matchesStarted++;
+    this.recent.unshift({ at: new Date().toISOString(), a: label(a.entry), b: label(b.entry), matchId: a.reply.matchId });
+    this.recent.length = Math.min(this.recent.length, 20);
+    this.publish();
+  }
+
+  /* ── the /monitor panel ─────────────────────────────────────────────
+   * Who is waiting goes into the room's METADATA (the monitor's room list
+   * shows it as columns — app.config.ts `monitor({ columns })`), and the
+   * full detail into the room's inspect page (its "State" tab). Nothing
+   * here reaches a phone: the queue room has no synced state. */
+
+  private publish() {
+    const waiting = [...this.waiting.values()].filter((w) => !w.paired);
+    this.setMetadata({
+      game: "fort_conquer",
+      waiting: waiting.length,
+      players: waiting.slice(0, 15).map((w) => label(w.entry)).join(", ") + (waiting.length > 15 ? ` +${waiting.length - 15}` : ""),
+      status: `${waiting.length} searching · ${this.matchesStarted} matched`,
+    }).catch(() => {});
+  }
+
+  /** The monitor's room page: every phone in the queue, and recent pairings. */
+  async getInspectData() {
+    const base = await (Room.prototype as any).getInspectData.call(this);
+    const now = Date.now();
+    return {
+      ...base,
+      state: {
+        searching: [...this.waiting.values()].map((w) => ({
+          name: w.entry.name || "(no name)", fortPower: w.entry.fortPower, level: w.entry.level,
+          stage: w.entry.stage, minerLevel: w.entry.mineralLevel, proto: w.entry.proto,
+          waitingSeconds: Math.round((now - w.ts) / 1000),
+          status: w.paired ? "paired, sending seat" : "searching",
+          sessionId: w.client.sessionId,
+        })),
+        matchesStarted: this.matchesStarted,
+        recentMatches: this.recent,
+      },
+    };
   }
 }

@@ -311,7 +311,15 @@ export const server = config({
     // (src/monitorGuard.ts). The playground is NOT mounted at "/": a guard
     // there would sit in front of every request the game itself makes.
     app.use("/playground", monitorGuard("Colyseus playground"), playground());
-    app.use("/monitor", monitorGuard("Colyseus monitor"), monitor());
+    // the arena rooms put who is in them into their metadata
+    // (ArenaQueueRoom/ArenaMatchRoom#publish*): shown here as columns
+    app.use("/monitor", monitorGuard("Colyseus monitor"), monitor({
+      columns: [
+        "roomId", "name", "clients", "maxClients",
+        { metadata: "players" }, { metadata: "status" }, { metadata: "stage" },
+        "locked", "elapsedTime",
+      ],
+    }));
     app.get("/express", (_, res) => res.json({ message: "Hello World" }));
     app.use(auth.prefix, auth.routes({}));
   },

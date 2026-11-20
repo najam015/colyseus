@@ -54,12 +54,15 @@ export class ArenaMatchRoom extends Room {
   /** Sides whose socket dropped and may come back: their events wait in
    *  `buffered` (sent to a dropped socket they would be lost). */
   private dropped = new Set<Side>();
+  /** Each side as the /monitor panel shows it. */
+  private status: Record<Side, string> = { a: "seat reserved", b: "seat reserved" };
 
   messages = {
     ready: (client: Client) => {
       const side = this.sideOf.get(client.sessionId);
       if (!side || this.ready.has(side)) return;
       this.ready.add(side);
+      this.setStatus(side, "playing");
       for (const [type, msg] of this.buffered[side].splice(0)) client.send(type, msg);
       if (this.gone.has(otherOf(side))) client.send("left", true);
     },
@@ -86,7 +89,12 @@ export class ArenaMatchRoom extends Room {
     this.node = options?.node;
     // nobody may find this room by matchmaking: seats are reserved by the queue
     this.setPrivate(true);
-    this.setMetadata({ game: "fort_conquer", a: this.node?.a?.name, b: this.node?.b?.name, stage: this.node?.stage });
+    const who = (s: Side) => `${this.node?.[s]?.name || "(no name)"} (FP ${this.node?.[s]?.fortPower ?? "?"})`;
+    this.setMetadata({
+      game: "fort_conquer", a: this.node?.a?.name, b: this.node?.b?.name, stage: this.node?.stage,
+      players: `${who("a")} vs ${who("b")}`,
+    });
+    this.publishStatus();
   }
 
 
@@ -94,11 +102,12 @@ export class ArenaMatchRoom extends Room {
     const side: Side = options?.side === "b" ? "b" : "a";
     this.clients_.set(side, client);
     this.sideOf.set(client.sessionId, side);
+    this.setStatus(side, "joined");
   }
 
   onDrop(client: Client) {
     const side = this.sideOf.get(client.sessionId);
-    if (side) this.dropped.add(side);
+    if (side) { this.dropped.add(side); this.setStatus(side, "reconnecting"); }
     this.allowReconnection(client, RECONNECT_SECONDS).catch(() => {});
   }
 
@@ -107,6 +116,7 @@ export class ArenaMatchRoom extends Room {
     if (!side) return;
     this.clients_.set(side, client);
     this.dropped.delete(side);
+    this.setStatus(side, this.ready.has(side) ? "playing" : "joined");
     // what was said while it was away (the phone also asks the other for
     // anything lost in flight, and drops what it already had)
     if (this.ready.has(side)) for (const [type, msg] of this.buffered[side].splice(0)) client.send(type, msg);
@@ -120,7 +130,40 @@ export class ArenaMatchRoom extends Room {
   private sideGone(side: Side) {
     if (this.gone.has(side)) return;
     this.gone.add(side);
+    this.setStatus(side, "left");
     this.toSide(otherOf(side), "left", true);
+  }
+
+  /* ── the /monitor panel: each side's status in the room's metadata (a
+   * column in the room list) and the detail on its inspect page ──────── */
+
+  private setStatus(side: Side, status: string) {
+    if (this.status[side] === status) return;
+    this.status[side] = status;
+    this.publishStatus();
+  }
+
+  private publishStatus() {
+    const name = (s: Side) => this.node?.[s]?.name || s.toUpperCase();
+    this.setMetadata({ status: `${name("a")}: ${this.status.a} · ${name("b")}: ${this.status.b}` }).catch(() => {});
+  }
+
+  async getInspectData() {
+    const base = await (Room.prototype as any).getInspectData.call(this);
+    const side = (s: Side) => ({
+      name: this.node?.[s]?.name || "(no name)", level: this.node?.[s]?.level,
+      fortPower: this.node?.[s]?.fortPower, minerLevel: this.node?.[s]?.mineralLevel,
+      status: this.status[s], sessionId: this.clients_.get(s)?.sessionId ?? null,
+      eventsWaitingForIt: this.buffered[s].length,
+    });
+    return {
+      ...base,
+      state: {
+        stage: this.node?.stage, seed: this.node?.seed,
+        startedAt: this.node?.createdAt ? new Date(this.node.createdAt).toISOString() : null,
+        a: side("a"), b: side("b"),
+      },
+    };
   }
 
   private toSide(side: Side, type: string, msg: unknown) {
