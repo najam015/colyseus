@@ -5,7 +5,9 @@
  * Every searching phone joins the ONE queue room (`joinOrCreate`) with its
  * entry — name, level, fort power, miner level, squad, stage — and waits.
  * Twice a second the room pairs whoever it can, longest-waiting first, by
- * the game's own rule (data/ArenaRules.js#pickByFortPower, ported below):
+ * the game's own rule (data/ArenaRules.js#pickOpponent, ported below): the
+ * SAME STAGE first, else the nearest stage within STAGE_WINDOW up or down
+ * (either way the nearest fort power among them), else by fort power alone —
  * the exact fort power, else the nearest up to POWER_WINDOW above, else up
  * to it below. A pair gets a match room (ArenaMatchRoom) and each phone is
  * sent its seat there with the match itself; the phone then leaves the queue.
@@ -20,6 +22,8 @@ import { Room, type Client, matchMaker, CloseCode } from "@colyseus/core";
 
 /** data/ArenaRules.js ARENA.powerWindow — keep in step. */
 export const POWER_WINDOW = 2000;
+/** data/ArenaRules.js ARENA.stageWindow — keep in step. */
+export const STAGE_WINDOW = 5;
 /** core/ArenaNet.js ARENA_PROTO: phones speaking another protocol never meet. */
 export const ARENA_PROTO = 2;
 const TICK_MS = 500;
@@ -51,8 +55,28 @@ export function pickByFortPower<T extends { fortPower: number; ts?: number }>(po
   return null;
 }
 
-/** "Hamza (FP 3000)" — how a player reads on the monitor. */
-const label = (e: ArenaEntry) => `${e.name || "(no name)"} (FP ${e.fortPower})`;
+/** data/ArenaRules.js#pickOpponent, verbatim in behaviour: the same stage,
+ *  else the nearest stage within STAGE_WINDOW (ties: nearest fort power,
+ *  then the longest wait), else pickByFortPower. */
+export function pickOpponent<T extends { stage?: number; fortPower: number; ts?: number }>(
+  me: { stage?: number; fortPower: number }, candidates: T[]): T | null {
+  const stage = Number(me.stage) || 1;
+  const gap = (c: T) => Math.abs((Number(c.stage) || 1) - stage);
+  const near = candidates.filter((c) => gap(c) <= STAGE_WINDOW);
+  if (near.length) {
+    return near.reduce((best, c) => {
+      const g = gap(c) - gap(best);
+      if (g) return g < 0 ? c : best;
+      const d = Math.abs(c.fortPower - me.fortPower) - Math.abs(best.fortPower - me.fortPower);
+      if (d) return d < 0 ? c : best;
+      return (c.ts ?? 0) < (best.ts ?? 0) ? c : best;
+    });
+  }
+  return pickByFortPower(me.fortPower, candidates);
+}
+
+/** "Hamza (S 42 · FP 3000)" — how a player reads on the monitor. */
+const label = (e: ArenaEntry) => `${e.name || "(no name)"} (S ${e.stage} · FP ${e.fortPower})`;
 
 const int = (v: unknown, lo: number, hi: number, dflt: number) =>
   Number.isFinite(Number(v)) ? Math.max(lo, Math.min(hi, Math.round(Number(v)))) : dflt;
@@ -124,8 +148,8 @@ export class ArenaQueueRoom extends Room {
       if (w.paired) continue;
       // only someone who has waited LESS claims w: w is side a, as in the Firebase queue
       const others = free().filter((o) => o !== w && !o.paired)
-        .map((o) => ({ o, fortPower: o.entry.fortPower, ts: o.ts }));
-      const pick = pickByFortPower(w.entry.fortPower, others);
+        .map((o) => ({ o, stage: o.entry.stage, fortPower: o.entry.fortPower, ts: o.ts }));
+      const pick = pickOpponent(w.entry, others);
       if (!pick) continue;
       await this.startMatch(w, pick.o);
     }
