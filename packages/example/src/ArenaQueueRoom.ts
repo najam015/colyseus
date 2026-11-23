@@ -5,11 +5,20 @@
  * Every searching phone joins the ONE queue room (`joinOrCreate`) with its
  * entry — name, level, fort power, miner level, squad, stage — and waits.
  * Twice a second the room pairs whoever it can, longest-waiting first, by
- * the game's own rule (data/ArenaRules.js#pickOpponent, ported below): the
- * SAME STAGE first, else the nearest stage within STAGE_WINDOW up or down
- * (either way the nearest fort power among them), else by fort power alone —
- * the exact fort power, else the nearest up to POWER_WINDOW above, else up
- * to it below. A pair gets a match room (ArenaMatchRoom) and each phone is
+ * `pickOpponent` below — THE matchmaking rule, decided here on the server so
+ * it can change with a deploy and no app release:
+ *   1. the SAME STAGE, else the nearest stage within STAGE_WINDOW up or down;
+ *   2. else the same MINER LEVEL, else the nearest within MINER_WINDOW;
+ *   3. else fort power alone (`pickByFortPower`): the exact power, else the
+ *      nearest up to POWER_WINDOW above, else up to it below.
+ * Inside tiers 1 and 2 a tie goes to the nearest fort power, then the longest
+ * wait. A side with no miner level (an old app) skips tier 2. The three
+ * windows come from the environment (STAGE_WINDOW, MINER_WINDOW,
+ * POWER_WINDOW). Every phone since 1.0.20 also sends `stats` — fort power,
+ * level, stage, miner level and its whole arena record — kept on the entry
+ * for rules still to come; an older phone's stats are rebuilt from the fields
+ * it always sent, so a rule never has to ask which version it is reading.
+ * A pair gets a match room (ArenaMatchRoom) and each phone is
  * sent its seat there with the match itself; the phone then leaves the queue.
  *
  * The phone keeps its own deadline. At it, it sends `cancel`: the answer is
@@ -20,17 +29,39 @@
  */
 import { Room, type Client, matchMaker, CloseCode } from "@colyseus/core";
 
-/** data/ArenaRules.js ARENA.powerWindow — keep in step. */
-export const POWER_WINDOW = 2000;
-/** data/ArenaRules.js ARENA.stageWindow — keep in step. */
-export const STAGE_WINDOW = 5;
+/** A window from the environment (e.g. MINER_WINDOW=3), else its default —
+ *  so a window can be retuned with a restart, not even a deploy. */
+const envInt = (name: string, dflt: number) => {
+  const raw = (process.env[name] ?? "").trim();
+  const v = Number(raw);
+  // unset, empty or not a whole number >= 0: the default (an empty value must
+  // never read as 0, which would allow exact matches only)
+  if (raw === "" || !Number.isInteger(v) || v < 0) {
+    if (raw !== "") console.warn(`[arena queue] ${name}="${raw}" is not a whole number >= 0, using ${dflt}`);
+    return dflt;
+  }
+  return v;
+};
+/** Fort power either side, for the last tier. */
+export const POWER_WINDOW = envInt("POWER_WINDOW", 2000);
+/** Stages up or down, for the first tier. */
+export const STAGE_WINDOW = envInt("STAGE_WINDOW", 5);
+/** Miner levels up or down, for the second tier. */
+export const MINER_WINDOW = envInt("MINER_WINDOW", 5);
 /** core/ArenaNet.js ARENA_PROTO: phones speaking another protocol never meet. */
 export const ARENA_PROTO = 2;
 const TICK_MS = 500;
 
+/** Everything a phone says about its player, for matchmaking: numbers only,
+ *  by name (`fortPower`, `level`, `stage`, `minerLevel`, `arenaPlayed`,
+ *  `arenaWon`, `arenaLost`, `arenaDraw`, `arenaLeft`, and whatever a later
+ *  app adds). */
+export type ArenaStats = Record<string, number>;
+
 export interface ArenaEntry {
   name: string; level: number; fortPower: number; mineralLevel: number | null;
   stage: number; squad: string; proto: number;
+  stats: ArenaStats;
 }
 
 interface Waiting { client: Client; entry: ArenaEntry; ts: number; paired: boolean; reply?: any }
@@ -55,34 +86,76 @@ export function pickByFortPower<T extends { fortPower: number; ts?: number }>(po
   return null;
 }
 
-/** data/ArenaRules.js#pickOpponent, verbatim in behaviour: the same stage,
- *  else the nearest stage within STAGE_WINDOW (ties: nearest fort power,
- *  then the longest wait), else pickByFortPower. */
-export function pickOpponent<T extends { stage?: number; fortPower: number; ts?: number }>(
-  me: { stage?: number; fortPower: number }, candidates: T[]): T | null {
+type Candidate = { stage?: number; minerLevel?: number | null; fortPower: number; ts?: number };
+
+/** The candidate nearest by `gap` (within `window`), ties to the nearest fort
+ *  power, then the longest wait; null when none is within the window. */
+function nearest<T extends Candidate>(me: Candidate, candidates: T[], gap: (c: T) => number, window: number): T | null {
+  const pool = candidates.filter((c) => gap(c) <= window);
+  if (!pool.length) return null;
+  return pool.reduce((best, c) => {
+    const g = gap(c) - gap(best);
+    if (g) return g < 0 ? c : best;
+    const d = Math.abs(c.fortPower - me.fortPower) - Math.abs(best.fortPower - me.fortPower);
+    if (d) return d < 0 ? c : best;
+    return (c.ts ?? 0) < (best.ts ?? 0) ? c : best;
+  });
+}
+
+/** THE matchmaking rule (see the header): stage, then miner level, then fort
+ *  power. A side whose miner level is unknown (an app from before miner
+ *  levels were sent) skips the miner tier rather than matching on a guess. */
+export function pickOpponent<T extends Candidate>(me: Candidate, candidates: T[]): T | null {
   const stage = Number(me.stage) || 1;
-  const gap = (c: T) => Math.abs((Number(c.stage) || 1) - stage);
-  const near = candidates.filter((c) => gap(c) <= STAGE_WINDOW);
-  if (near.length) {
-    return near.reduce((best, c) => {
-      const g = gap(c) - gap(best);
-      if (g) return g < 0 ? c : best;
-      const d = Math.abs(c.fortPower - me.fortPower) - Math.abs(best.fortPower - me.fortPower);
-      if (d) return d < 0 ? c : best;
-      return (c.ts ?? 0) < (best.ts ?? 0) ? c : best;
-    });
+  const byStage = nearest(me, candidates, (c) => Math.abs((Number(c.stage) || 1) - stage), STAGE_WINDOW);
+  if (byStage) return byStage;
+  const miner = me.minerLevel;
+  if (miner != null) {
+    const known = candidates.filter((c) => c.minerLevel != null);
+    const byMiner = nearest(me, known, (c) => Math.abs((c.minerLevel as number) - miner), MINER_WINDOW);
+    if (byMiner) return byMiner;
   }
   return pickByFortPower(me.fortPower, candidates);
 }
 
+/** What the rule reads off an entry. The top-level fields are what every
+ *  app version sends, so they win over `stats`. */
+export const matchKeys = (e: ArenaEntry) => ({
+  stage: e.stage,
+  fortPower: e.fortPower,
+  minerLevel: e.mineralLevel ?? (Number.isFinite(e.stats.minerLevel) ? e.stats.minerLevel : null),
+});
+
 /** "Hamza (S 42 · FP 3000)" — how a player reads on the monitor. */
-const label = (e: ArenaEntry) => `${e.name || "(no name)"} (S ${e.stage} · FP ${e.fortPower})`;
+/** "Hamza (S 42 · M 60 · FP 3000 · W 6 L 4 D 2 Left 1)" — how a player
+ *  reads on the monitor. The arena record shows only for an app that sends
+ *  it (1.0.20+); an older app reads "· arena: old app". */
+export const label = (e: ArenaEntry) => {
+  const st = e.stats ?? {};
+  const miner = e.mineralLevel ?? st.minerLevel;
+  const arena = Number.isFinite(st.arenaPlayed)
+    ? ` · W ${st.arenaWon ?? 0} L ${st.arenaLost ?? 0} D ${st.arenaDraw ?? 0} Left ${st.arenaLeft ?? 0} of ${st.arenaPlayed}`
+    : " · arena: old app";
+  return `${e.name || "(no name)"} (S ${e.stage}${miner != null ? ` · M ${miner}` : ""} · FP ${e.fortPower}${arena})`;
+};
 
 const int = (v: unknown, lo: number, hi: number, dflt: number) =>
   Number.isFinite(Number(v)) ? Math.max(lo, Math.min(hi, Math.round(Number(v)))) : dflt;
 
-function cleanEntry(o: any): ArenaEntry {
-  return {
+/** A phone's `stats`, kept to numbers: at most 64 named fields, each a
+ *  finite number (anything else is dropped, never trusted). */
+function cleanStats(o: any): ArenaStats {
+  const out: ArenaStats = {};
+  if (!o || typeof o !== "object" || Array.isArray(o)) return out;
+  for (const [k, v] of Object.entries(o).slice(0, 64)) {
+    if (typeof v !== "number" || !Number.isFinite(v)) continue;
+    if (/^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(k)) out[k] = Math.max(-1e12, Math.min(1e12, v));
+  }
+  return out;
+}
+
+export function cleanEntry(o: any): ArenaEntry {
+  const e = {
     name: String(o?.name ?? "").slice(0, 24),
     level: int(o?.level, 1, 9999, 1),
     fortPower: int(o?.fortPower, 0, 1e9, 0),
@@ -91,6 +164,11 @@ function cleanEntry(o: any): ArenaEntry {
     squad: typeof o?.squad === "string" ? o.squad.slice(0, 20000) : "[]",
     proto: int(o?.proto, 0, 999, 0),
   };
+  // an older app sends no stats: rebuild what it did send, so a rule can
+  // always read stats.fortPower / .level / .stage / .minerLevel
+  const base: ArenaStats = { fortPower: e.fortPower, level: e.level, stage: e.stage };
+  if (e.mineralLevel != null) base.minerLevel = e.mineralLevel;
+  return { ...e, stats: { ...cleanStats(o?.stats), ...base } };
 }
 
 export class ArenaQueueRoom extends Room {
@@ -123,6 +201,7 @@ export class ArenaQueueRoom extends Room {
   };
 
   onCreate() {
+    console.log(`[arena queue] matchmaking: stage ±${STAGE_WINDOW}, then miner ±${MINER_WINDOW}, then fort power ±${POWER_WINDOW}; protocol ${ARENA_PROTO}`);
     this.clock.setInterval(() => this.pairUp().catch((e) => console.error("[arena queue]", e)), TICK_MS);
   }
 
@@ -148,8 +227,8 @@ export class ArenaQueueRoom extends Room {
       if (w.paired) continue;
       // only someone who has waited LESS claims w: w is side a, as in the Firebase queue
       const others = free().filter((o) => o !== w && !o.paired)
-        .map((o) => ({ o, stage: o.entry.stage, fortPower: o.entry.fortPower, ts: o.ts }));
-      const pick = pickOpponent(w.entry, others);
+        .map((o) => ({ o, ...matchKeys(o.entry), ts: o.ts }));
+      const pick = pickOpponent(matchKeys(w.entry), others);
       if (!pick) continue;
       await this.startMatch(w, pick.o);
     }
@@ -219,6 +298,7 @@ export class ArenaQueueRoom extends Room {
         searching: [...this.waiting.values()].map((w) => ({
           name: w.entry.name || "(no name)", fortPower: w.entry.fortPower, level: w.entry.level,
           stage: w.entry.stage, minerLevel: w.entry.mineralLevel, proto: w.entry.proto,
+          stats: w.entry.stats,
           waitingSeconds: Math.round((now - w.ts) / 1000),
           status: w.paired ? "paired, sending seat" : "searching",
           sessionId: w.client.sessionId,
