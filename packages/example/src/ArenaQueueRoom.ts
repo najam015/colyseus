@@ -26,6 +26,16 @@
  * moment, "matched" with the seat — so a phone is never matched and then
  * absent. (Replies are plain messages, not `room.request()`, so SDK 0.17
  * clients work.)
+ *
+ * FRIEND ROOMS (1.0.21+): a phone that joins with `room: "host"` is never
+ * matchmade; it is given a 6-digit code ("room_code" { code }) and waits —
+ * with no deadline — for a friend who joins with `room: "join", code`. The
+ * two get an ordinary match room, marked `friendly` (the game pays nothing
+ * for it and fines nothing). A code that is not open is answered
+ * "room_error" { reason: "not_found" }. The host leaving (or sending
+ * "cancel") closes the code. An older server ignores `room` and matchmakes
+ * the host instead: the app waits for "room_code" and gives up without it,
+ * so DEPLOY THE SERVER FIRST.
  */
 import { Room, type Client, matchMaker, CloseCode } from "@colyseus/core";
 
@@ -64,7 +74,21 @@ export interface ArenaEntry {
   stats: ArenaStats;
 }
 
-interface Waiting { client: Client; entry: ArenaEntry; ts: number; paired: boolean; reply?: any }
+interface Waiting {
+  client: Client; entry: ArenaEntry; ts: number; paired: boolean; reply?: any;
+  /** a friend-room host's code: never matchmade, only joined by code */
+  code?: string;
+}
+
+/** A friend room's code: 6 digits, no leading zero (it reads as a number). */
+export const newRoomCode = (taken: (code: string) => boolean): string => {
+  for (let i = 0; i < 1000; i++) {
+    const code = String(100000 + Math.floor(Math.random() * 900000));
+    if (!taken(code)) return code;
+  }
+  throw new Error("no free room code");
+};
+export const cleanCode = (v: unknown) => String(v ?? "").replace(/\D/g, "").slice(0, 6);
 
 
 /** data/ArenaRules.js#pickByFortPower, verbatim in behaviour. */
@@ -180,6 +204,7 @@ export class ArenaQueueRoom extends Room {
    *  expired") and every search ended with the bot. */
   seatReservationTimeout = 60;
   private waiting = new Map<string, Waiting>();   // sessionId -> waiting phone
+  private hosts = new Map<string, Waiting>();     // friend-room code -> its host
   private matched = new Map<string, any>();       // sessionId -> its seat, until it leaves
   /** The last pairings, newest first — for the /monitor panel only. */
   private recent: Array<{ at: string; a: string; b: string; matchId: string }> = [];
@@ -194,6 +219,7 @@ export class ArenaQueueRoom extends Room {
       if (seat) { client.send("matched", seat); return; }
       const w = this.waiting.get(client.sessionId);
       if (w?.paired) return;                     // the seat is on its way as "matched"
+      if (w?.code) this.hosts.delete(w.code);
       this.waiting.delete(client.sessionId);
       client.send("cancelled", true);
       this.publish();
@@ -209,19 +235,38 @@ export class ArenaQueueRoom extends Room {
   onJoin(client: Client, options: any) {
     const entry = cleanEntry(options?.entry);
     if (entry.proto !== ARENA_PROTO) { client.leave(CloseCode.WITH_ERROR, "protocol"); return; }
-    this.waiting.set(client.sessionId, { client, entry, ts: Date.now(), paired: false });
+    const w: Waiting = { client, entry, ts: Date.now(), paired: false };
+    if (options?.room === "host") {
+      w.code = newRoomCode((c) => this.hosts.has(c));
+      this.hosts.set(w.code, w);
+      this.waiting.set(client.sessionId, w);
+      client.send("room_code", { code: w.code });
+    } else if (options?.room === "join") {
+      // not queued: either straight into the host's match, or told why not
+      const host = this.hosts.get(cleanCode(options?.code));
+      if (!host || host.paired) { client.send("room_error", { reason: "not_found" }); return; }
+      if (host.entry.proto !== entry.proto) { client.send("room_error", { reason: "version" }); return; }
+      this.hosts.delete(host.code!);
+      this.waiting.set(client.sessionId, w);
+      this.startMatch(host, w, { friendly: true }).catch((e) => console.error("[arena queue]", e));
+    } else {
+      this.waiting.set(client.sessionId, w);
+    }
     this.publish();
   }
 
   onLeave(client: Client) {
     const w = this.waiting.get(client.sessionId);
+    if (w?.code && this.hosts.get(w.code) === w) this.hosts.delete(w.code);
     if (w && !w.paired) this.waiting.delete(client.sessionId);
     this.matched.delete(client.sessionId);
     this.publish();
   }
 
   private async pairUp() {
-    const free = () => [...this.waiting.values()].filter((w) => !w.paired)
+    // friend-room hosts are never matchmade (a friend joining by code is
+    // marked paired by startMatch before anything awaits)
+    const free = () => [...this.waiting.values()].filter((w) => !w.paired && !w.code)
       .sort((x, y) => x.ts - y.ts);
     for (const w of free()) {
       if (w.paired) continue;
@@ -234,7 +279,7 @@ export class ArenaQueueRoom extends Room {
     }
   }
 
-  private async startMatch(a: Waiting, b: Waiting) {
+  private async startMatch(a: Waiting, b: Waiting, { friendly = false } = {}) {
     a.paired = b.paired = true;
     const side = (w: Waiting) => ({
       uid: w.client.sessionId,
@@ -247,6 +292,7 @@ export class ArenaQueueRoom extends Room {
       stage: Math.max(a.entry.stage, b.entry.stage),
       seed: (Math.random() * 0x100000000) >>> 0,
       createdAt: Date.now(), proto: ARENA_PROTO,
+      ...(friendly ? { friendly: true } : {}),
     };
     try {
       const room = await matchMaker.createRoom("fc_arena", { node });
@@ -261,13 +307,19 @@ export class ArenaQueueRoom extends Room {
     } catch (err) {
       console.error("[arena queue] could not start a match:", err);
       a.paired = b.paired = false;
+      if (friendly) {
+        // a friend room cannot fall back to matchmaking: tell the friend, keep the host's code open
+        this.waiting.delete(b.client.sessionId);
+        if (a.code) this.hosts.set(a.code, a);
+        b.client.send("room_error", { reason: "not_found" });
+      }
       return;
     }
     // they leave by themselves once they have their seat; forget them now
     this.waiting.delete(a.client.sessionId);
     this.waiting.delete(b.client.sessionId);
     this.matchesStarted++;
-    this.recent.unshift({ at: new Date().toISOString(), a: label(a.entry), b: label(b.entry), matchId: a.reply.matchId });
+    this.recent.unshift({ at: new Date().toISOString(), a: label(a.entry), b: label(b.entry) + (friendly ? " [friend room]" : ""), matchId: a.reply.matchId });
     this.recent.length = Math.min(this.recent.length, 20);
     this.publish();
   }
@@ -279,12 +331,12 @@ export class ArenaQueueRoom extends Room {
    * here reaches a phone: the queue room has no synced state. */
 
   private publish() {
-    const waiting = [...this.waiting.values()].filter((w) => !w.paired);
+    const waiting = [...this.waiting.values()].filter((w) => !w.paired && !w.code);
     this.setMetadata({
       game: "fort_conquer",
       waiting: waiting.length,
       players: waiting.slice(0, 15).map((w) => label(w.entry)).join(", ") + (waiting.length > 15 ? ` +${waiting.length - 15}` : ""),
-      status: `${waiting.length} searching · ${this.matchesStarted} matched`,
+      status: `${waiting.length} searching · ${this.hosts.size} friend rooms open · ${this.matchesStarted} matched`,
     }).catch(() => {});
   }
 
@@ -300,7 +352,7 @@ export class ArenaQueueRoom extends Room {
           stage: w.entry.stage, minerLevel: w.entry.mineralLevel, proto: w.entry.proto,
           stats: w.entry.stats,
           waitingSeconds: Math.round((now - w.ts) / 1000),
-          status: w.paired ? "paired, sending seat" : "searching",
+          status: w.paired ? "paired, sending seat" : w.code ? `friend room ${w.code}` : "searching",
           sessionId: w.client.sessionId,
         })),
         matchesStarted: this.matchesStarted,
