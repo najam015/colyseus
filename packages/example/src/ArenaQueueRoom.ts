@@ -36,6 +36,15 @@
  * "cancel") closes the code. An older server ignores `room` and matchmakes
  * the host instead: the app waits for "room_code" and gives up without it,
  * so DEPLOY THE SERVER FIRST.
+ *
+ * PRIZES: a host may also send `prize: { currency, amount }` — one of
+ * ROOM_PRIZES' slots (anything else is no prize). A friend joining a prize
+ * room is NOT started at once: it is sent "room_info" { prize, name } and the
+ * room is held for it until it answers "accept" (the match starts, the node
+ * carrying `prize`) or "decline" / leaves / PRIZE_ACCEPT_S passes (the code
+ * opens again). A second friend meanwhile is answered "room_error" { reason:
+ * "busy" }. The money itself moves on the phones (the game escrows both
+ * stakes at the start and pays the winner): this room only carries the deal.
  */
 import { Room, type Client, matchMaker, CloseCode } from "@colyseus/core";
 
@@ -78,7 +87,21 @@ interface Waiting {
   client: Client; entry: ArenaEntry; ts: number; paired: boolean; reply?: any;
   /** a friend-room host's code: never matchmade, only joined by code */
   code?: string;
+  /** a friend-room host's prize, if it put one up */
+  prize?: RoomPrize | null;
+  /** a friend deciding on the prize: the room is held for it */
+  pending?: { joiner: Waiting; timer: { clear(): void } } | null;
 }
+
+/** The game's data/ArenaRules.js ROOM_PRIZES: keep them in step. */
+export const ROOM_PRIZES: Record<string, number[]> = { coins: [500, 1000, 2000, 5000], crystals: [10, 20, 50, 100] };
+export type RoomPrize = { currency: "coins" | "crystals"; amount: number };
+export const cleanPrize = (p: any): RoomPrize | null => {
+  const currency = p?.currency, amount = Number(p?.amount);
+  return ROOM_PRIZES[currency]?.includes(amount) ? { currency, amount } : null;
+};
+/** Seconds a prize room is held for a friend reading the prize. */
+const PRIZE_ACCEPT_S = 60;
 
 /** A friend room's code: 6 digits, no leading zero (it reads as a number). */
 export const newRoomCode = (taken: (code: string) => boolean): string => {
@@ -219,10 +242,27 @@ export class ArenaQueueRoom extends Room {
       if (seat) { client.send("matched", seat); return; }
       const w = this.waiting.get(client.sessionId);
       if (w?.paired) return;                     // the seat is on its way as "matched"
-      if (w?.code) this.hosts.delete(w.code);
+      if (w?.code) { this.release(w); this.hosts.delete(w.code); }
       this.waiting.delete(client.sessionId);
       client.send("cancelled", true);
       this.publish();
+    },
+    /** A friend agrees to the room's prize: the match starts. */
+    accept: (client: Client) => {
+      const host = this.hostPendingFor(client.sessionId);
+      if (!host || host.paired) { client.send("room_error", { reason: "not_found" }); return; }
+      const joiner = host.pending!.joiner;
+      host.pending!.timer.clear();
+      host.pending = null;
+      this.hosts.delete(host.code!);
+      this.waiting.set(client.sessionId, joiner);
+      this.startMatch(host, joiner, { friendly: true, prize: host.prize ?? null }).catch((e) => console.error("[arena queue]", e));
+      this.publish();
+    },
+    /** A friend turns the prize down: the room opens for another. */
+    decline: (client: Client) => {
+      const host = this.hostPendingFor(client.sessionId);
+      if (host) this.release(host);
     },
   };
 
@@ -238,6 +278,7 @@ export class ArenaQueueRoom extends Room {
     const w: Waiting = { client, entry, ts: Date.now(), paired: false };
     if (options?.room === "host") {
       w.code = newRoomCode((c) => this.hosts.has(c));
+      w.prize = cleanPrize(options?.prize);
       this.hosts.set(w.code, w);
       this.waiting.set(client.sessionId, w);
       client.send("room_code", { code: w.code });
@@ -246,6 +287,16 @@ export class ArenaQueueRoom extends Room {
       const host = this.hosts.get(cleanCode(options?.code));
       if (!host || host.paired) { client.send("room_error", { reason: "not_found" }); return; }
       if (host.entry.proto !== entry.proto) { client.send("room_error", { reason: "version" }); return; }
+      if (host.pending) { client.send("room_error", { reason: "busy" }); return; }
+      if (host.prize) {
+        // the friend reads the prize first; the room is held for it meanwhile
+        const timer = this.clock.setTimeout(() => {
+          if (host.pending?.joiner === w) { this.release(host); w.client.send("room_error", { reason: "not_found" }); }
+        }, PRIZE_ACCEPT_S * 1000);
+        host.pending = { joiner: w, timer };
+        client.send("room_info", { prize: host.prize, name: host.entry.name });
+        return;
+      }
       this.hosts.delete(host.code!);
       this.waiting.set(client.sessionId, w);
       this.startMatch(host, w, { friendly: true }).catch((e) => console.error("[arena queue]", e));
@@ -256,11 +307,32 @@ export class ArenaQueueRoom extends Room {
   }
 
   onLeave(client: Client) {
+    // a friend deciding on a prize, gone: the room opens again
+    const holding = this.hostPendingFor(client.sessionId);
+    if (holding) this.release(holding);
     const w = this.waiting.get(client.sessionId);
-    if (w?.code && this.hosts.get(w.code) === w) this.hosts.delete(w.code);
+    if (w?.code && this.hosts.get(w.code) === w) {
+      // the host gone: a friend reading its prize is told so
+      const pending = w.pending;
+      this.release(w);
+      pending?.joiner.client.send("room_error", { reason: "not_found" });
+      this.hosts.delete(w.code);
+    }
     if (w && !w.paired) this.waiting.delete(client.sessionId);
     this.matched.delete(client.sessionId);
     this.publish();
+  }
+
+  /** The host whose room is held for `sessionId`, if any. */
+  private hostPendingFor(sessionId: string): Waiting | null {
+    for (const h of this.hosts.values()) if (h.pending?.joiner.client.sessionId === sessionId) return h;
+    return null;
+  }
+
+  /** Lets go of a held room (its timer too). */
+  private release(host: Waiting) {
+    host.pending?.timer.clear();
+    host.pending = null;
   }
 
   private async pairUp() {
@@ -279,7 +351,7 @@ export class ArenaQueueRoom extends Room {
     }
   }
 
-  private async startMatch(a: Waiting, b: Waiting, { friendly = false } = {}) {
+  private async startMatch(a: Waiting, b: Waiting, { friendly = false, prize = null as RoomPrize | null } = {}) {
     a.paired = b.paired = true;
     const side = (w: Waiting) => ({
       uid: w.client.sessionId,
@@ -293,6 +365,7 @@ export class ArenaQueueRoom extends Room {
       seed: (Math.random() * 0x100000000) >>> 0,
       createdAt: Date.now(), proto: ARENA_PROTO,
       ...(friendly ? { friendly: true } : {}),
+      ...(prize ? { prize } : {}),
     };
     try {
       const room = await matchMaker.createRoom("fc_arena", { node });
@@ -319,7 +392,7 @@ export class ArenaQueueRoom extends Room {
     this.waiting.delete(a.client.sessionId);
     this.waiting.delete(b.client.sessionId);
     this.matchesStarted++;
-    this.recent.unshift({ at: new Date().toISOString(), a: label(a.entry), b: label(b.entry) + (friendly ? " [friend room]" : ""), matchId: a.reply.matchId });
+    this.recent.unshift({ at: new Date().toISOString(), a: label(a.entry), b: label(b.entry) + (friendly ? ` [friend room${prize ? `, prize ${prize.amount} ${prize.currency}` : ""}]` : ""), matchId: a.reply.matchId });
     this.recent.length = Math.min(this.recent.length, 20);
     this.publish();
   }
@@ -352,7 +425,7 @@ export class ArenaQueueRoom extends Room {
           stage: w.entry.stage, minerLevel: w.entry.mineralLevel, proto: w.entry.proto,
           stats: w.entry.stats,
           waitingSeconds: Math.round((now - w.ts) / 1000),
-          status: w.paired ? "paired, sending seat" : w.code ? `friend room ${w.code}` : "searching",
+          status: w.paired ? "paired, sending seat" : w.code ? `friend room ${w.code}${w.prize ? ` (prize ${w.prize.amount} ${w.prize.currency})` : ""}` : "searching",
           sessionId: w.client.sessionId,
         })),
         matchesStarted: this.matchesStarted,
